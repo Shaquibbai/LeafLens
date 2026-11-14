@@ -1,4 +1,4 @@
-# LeafLens 🌾
+# LeafLens 
 
 An image-based crop leaf disease detection web application developed as a six-member university software development project.
 
@@ -6,7 +6,7 @@ The initial scope supports **rice only**, providing leaf disease identification,
 
 ---
 
-## 🛠️ Technology Stack
+## Technology Stack
 
 * **Frontend:** React 18, TypeScript, Vite, Tailwind CSS, Lucide Icons
 * **Backend:** Python (FastAPI, Uvicorn, Pydantic)
@@ -14,9 +14,9 @@ The initial scope supports **rice only**, providing leaf disease identification,
 
 ---
 
-## 📌 Implementation Status
+## Implementation Status
 
-### ✅ Implemented (Milestone 1 — Repository Foundation & Scaffold)
+### Implemented(Repository Foundation & Scaffold)
 * **Decoupled Architecture:** Clean separation into `frontend/` and `backend/` directories.
 * **FastAPI Backend Service:** Running with CORS middleware, discovery route (`GET /`), and health check endpoint (`GET /api/v1/health`).
 * **React + Vite Frontend:** Modern React 18 with TypeScript and Tailwind CSS configured with the custom "Paddy & Earth" palette.
@@ -24,21 +24,19 @@ The initial scope supports **rice only**, providing leaf disease identification,
 * **System Connectivity Dashboard:** A verification view in `frontend/src/App.tsx` that pings the backend and displays active status and metadata.
 * **Deterministic Dependencies:** Frontend dependencies are locked through `frontend/package-lock.json`, while backend dependencies are pinned in `backend/requirements.txt`.
 
-### ⏳ Planned (Future Milestones — Not Yet Implemented)
-* **Milestone 2:** Landing page visual layout, brand elements, and crop selector locked to rice.
-* **Milestone 3:** Leaf image upload zone, file validation, instant preview, and photography guidance.
-* **Milestone 4:** Backend `POST /api/v1/predict` endpoint, Pillow image pipeline, and provisional rice disease knowledge base.
-* **Milestone 5:** Diagnostic results view with model confidence meter, symptoms, and actionable recommendations.
-* **Milestone 6:** Machine learning model training, weight export, and inference integration.
-* **Milestone 7:** Cross-device testing, accessibility audits, and final team presentation polish.
+### Planned(Not Yet Implemented)
+* Landing page visual layout, brand elements, and crop selector locked to rice.
+* Leaf image upload zone, file validation, instant preview, and photography guidance.
+* Backend `POST /api/v1/predict` endpoint, Pillow image pipeline, and provisional rice disease knowledge base.
+* Diagnostic results view with model confidence meter, symptoms, and actionable recommendations.
+* Machine learning model training, weight export, and inference integration.
+* Cross-device testing, accessibility audits, and final team presentation polish.
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
-The directory tree below reflects the exact files currently present in the repository:
-
-```text
+```
 LeafLens/
 ├── backend/
 │   ├── app/
@@ -73,13 +71,13 @@ LeafLens/
 
 ---
 
-## 🚀 Quick Start Guide for Team Members (Windows Setup)
+## Quick Start Guide for Team Members (Windows Setup)
 
 ### System Prerequisites
 * **Node.js:** v18.0.0 or later (v20+ or v24 LTS recommended)
 * **Python:**
   * **Tested & Verified Runtime:** Python 3.9.2 (64-bit on Windows)
-  * **Recommended Team Target:** Python 3.11 (or 3.10) for long-term cross-platform compatibility across Windows, macOS, and Linux. *(Note: Python 3.11 was not present on the development machine during Milestone 1 verification, so physical execution was verified using Python 3.9.2).*
+  * **Recommended Team Target:** Python 3.11 (or 3.10) for long-term cross-platform compatibility across Windows, macOS, and Linux. *(Note: Python 3.11 was not present on the development machine during verification, so physical execution was verified using Python 3.9.2).*
 
 ---
 
@@ -159,7 +157,7 @@ Open `http://127.0.0.1:5173` in your browser. You should see the **LeafLens Syst
 
 ---
 
-## 🎓 Related Academic Component: DBMS
+## Related Academic Component: DBMS
 
 * **Mandatory Database System:** **PostgreSQL** is the required Relational Database Management System (DBMS) for the academic DBMS course component of LeafLens, as specifically instructed by the course teacher.
 * **Scope of DBMS Coursework:** The DBMS component will use PostgreSQL for relational database design, implementation, queries, stored procedures, functions, triggers, and other required database operations as mandated by the course curriculum.
@@ -168,7 +166,7 @@ Open `http://127.0.0.1:5173` in your browser. You should see the **LeafLens Syst
 
 ---
 
-## 👥 Team Collaboration Guidelines
+## Team Collaboration Guidelines
 
 * Always work on a feature branch (e.g., `git checkout -b feature/milestone-2-landing-page`).
 * Run `npm ci` (not `npm install`) when pulling updates to maintain consistent dependency resolution from `package-lock.json`.
