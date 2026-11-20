@@ -10,38 +10,47 @@
 SET search_path = leaflense, public;
 
 -- ============================================================================
--- QUERY 1: Retrieve Submission Details with Predictions & Model Information
+-- QUERY 1: Retrieve Farmer Submission Report by submission_id
 -- ----------------------------------------------------------------------------
--- Returns the full picture for a single submission: image path, timestamps,
--- current status, every prediction row with its disease label, the model that
--- produced it, confidence score, and whether it was the top prediction.
+-- Returns the complete farmer-facing report for a single submission_id:
+--   • Uses LEFT JOINs so 'pending' submissions still return a row.
+--   • If status is 'pending' or 'low_confidence', status is returned as
+--     'pending' and prediction, disease, and recommendation columns are NULL.
+--   • If status is 'processed', returns the AI prediction, symptoms, and
+--     linked treatment recommendations.
+--   • If status is 'reviewed', returns the admin-verified diagnosis, admin
+--     notes, symptoms, and linked treatment recommendations.
 --
--- Usage: replace :submission_id with the target submission's ID.
+-- FRONTEND CONNECTIVITY:
+-- Your backend API (e.g. GET /api/submissions/:id/report) can run:
+--   SELECT * FROM leaflense.get_farmer_submission_report(:submission_id);
+-- Or query the view directly:
+--   SELECT * FROM leaflense.v_farmer_submission_reports WHERE submission_id = $1;
 -- ============================================================================
 
 -- Parameter: :submission_id  (INTEGER – the submission to look up)
 
 SELECT
-    s.submission_id,
-    s.image_path,
-    s.submitted_at,
-    s.status,
-    d.disease_name,
-    m.model_name,
-    m.version                AS model_version,
-    p.confidence_score,
-    p.is_top_prediction,
-    p.predicted_at
+    submission_id,
+    image_path,
+    additional_info,
+    submitted_at,
+    status,
+    disease_id,
+    disease_name,
+    disease_description,
+    symptoms,
+    confidence_score,
+    model_name,
+    model_version,
+    diagnosis_source,
+    reviewed_at,
+    admin_notes,
+    recommendations
 FROM
-    Submissions  s
-    INNER JOIN Predictions p ON p.submission_id = s.submission_id
-    INNER JOIN Models      m ON m.model_id      = p.model_id
-    INNER JOIN Diseases    d ON d.disease_id    = p.disease_id
+    v_farmer_submission_reports
 WHERE
-    s.submission_id = 1   -- << replace with :submission_id parameter
-ORDER BY
-    s.submitted_at DESC,
-    p.confidence_score DESC;
+    submission_id = 1;   -- << replace with :submission_id parameter
 
 
 -- ============================================================================

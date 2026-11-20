@@ -87,6 +87,163 @@ $$;
 GRANT EXECUTE ON FUNCTION get_pending_low_confidence_submissions() TO leaflense_admin, leaflense_app, leaflense_readonly;
 
 -- ============================================================================
+-- FRONTEND INTEGRATION: FARMER SUBMISSION REPORT VIEW & FUNCTION
+-- ----------------------------------------------------------------------------
+-- Powers the Farmer Report Lookup field by submission_id.
+--   • If status is 'pending' or 'low_confidence': returns submission_id and
+--     status = 'pending', while prediction, disease, and recommendation fields
+--     are all NULL so unverified low-confidence predictions are never exposed.
+--   • If status is 'processed': returns the high-confidence AI diagnosis,
+--     symptoms, and linked treatment recommendations.
+--   • If status is 'reviewed': returns the admin-verified diagnosis
+--     (assessed_disease_id), admin notes, symptoms, and recommendations.
+-- ============================================================================
+
+DROP VIEW IF EXISTS v_farmer_submission_reports CASCADE;
+
+CREATE OR REPLACE VIEW v_farmer_submission_reports AS
+SELECT
+    s.submission_id,
+    s.image_path,
+    s.additional_info,
+    s.submitted_at,
+    CASE
+        WHEN s.status IN ('pending', 'low_confidence') THEN 'pending'
+        ELSE s.status::TEXT
+    END AS status,
+    d.disease_id,
+    d.disease_name,
+    d.description                                           AS disease_description,
+    d.symptoms,
+    CASE
+        WHEN s.status IN ('processed', 'reviewed') THEN p.confidence_score
+        ELSE NULL
+    END AS confidence_score,
+    CASE
+        WHEN s.status IN ('processed', 'reviewed') THEN m.model_name
+        ELSE NULL
+    END AS model_name,
+    CASE
+        WHEN s.status IN ('processed', 'reviewed') THEN m.version
+        ELSE NULL
+    END AS model_version,
+    CASE
+        WHEN s.status = 'processed' THEN 'ai_model'
+        WHEN s.status = 'reviewed'  THEN 'admin_review'
+        ELSE NULL
+    END AS diagnosis_source,
+    CASE
+        WHEN s.status = 'reviewed' THEN ar.reviewed_at
+        ELSE NULL
+    END AS reviewed_at,
+    CASE
+        WHEN s.status = 'reviewed' THEN ar.notes
+        ELSE NULL
+    END AS admin_notes,
+    rec.recommendations
+FROM
+    Submissions s
+    LEFT JOIN LATERAL (
+        SELECT
+            p_inner.model_id,
+            p_inner.disease_id,
+            p_inner.confidence_score
+        FROM Predictions p_inner
+        WHERE p_inner.submission_id = s.submission_id
+          AND p_inner.is_top_prediction = TRUE
+        ORDER BY p_inner.predicted_at DESC, p_inner.prediction_id DESC
+        LIMIT 1
+    ) p ON TRUE
+    LEFT JOIN Models m
+        ON m.model_id = p.model_id
+    LEFT JOIN LATERAL (
+        SELECT
+            ar_inner.assessed_disease_id,
+            ar_inner.notes,
+            ar_inner.reviewed_at
+        FROM AdminReviews ar_inner
+        WHERE ar_inner.submission_id = s.submission_id
+        ORDER BY ar_inner.reviewed_at DESC
+        LIMIT 1
+    ) ar ON TRUE
+    LEFT JOIN Diseases d
+        ON d.disease_id = CASE
+            WHEN s.status = 'reviewed'  THEN ar.assessed_disease_id
+            WHEN s.status = 'processed' THEN p.disease_id
+            ELSE NULL
+        END
+    LEFT JOIN LATERAL (
+        SELECT
+            JSONB_AGG(
+                JSONB_BUILD_OBJECT(
+                    'recommendation_id', r.recommendation_id,
+                    'title',             r.title,
+                    'description',       r.description,
+                    'source',            r.source
+                )
+                ORDER BY r.recommendation_id
+            ) AS recommendations
+        FROM DiseaseRecommendations dr
+        INNER JOIN Recommendations r
+            ON r.recommendation_id = dr.recommendation_id
+        WHERE dr.disease_id = d.disease_id
+    ) rec ON d.disease_id IS NOT NULL;
+
+GRANT SELECT ON v_farmer_submission_reports TO leaflense_admin, leaflense_app, leaflense_readonly;
+
+COMMENT ON VIEW v_farmer_submission_reports
+    IS 'Returns farmer-facing submission reports; hides predictions and recommendations as NULL with status "pending" until high-confidence processing or admin review completes.';
+
+CREATE OR REPLACE FUNCTION get_farmer_submission_report(p_submission_id INT)
+RETURNS TABLE (
+    submission_id        INT,
+    image_path           VARCHAR,
+    additional_info      TEXT,
+    submitted_at         TIMESTAMPTZ,
+    status               TEXT,
+    disease_id           INT,
+    disease_name         VARCHAR,
+    disease_description  TEXT,
+    symptoms             TEXT,
+    confidence_score     NUMERIC(5,4),
+    model_name           VARCHAR,
+    model_version        VARCHAR,
+    diagnosis_source     TEXT,
+    reviewed_at          TIMESTAMPTZ,
+    admin_notes          TEXT,
+    recommendations      JSONB
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = leaflense, public
+AS $$
+    SELECT
+        submission_id,
+        image_path,
+        additional_info,
+        submitted_at,
+        status,
+        disease_id,
+        disease_name,
+        disease_description,
+        symptoms,
+        confidence_score,
+        model_name,
+        model_version,
+        diagnosis_source,
+        reviewed_at,
+        admin_notes,
+        recommendations
+    FROM v_farmer_submission_reports
+    WHERE submission_id = p_submission_id;
+$$;
+
+GRANT EXECUTE ON FUNCTION get_farmer_submission_report(INT) TO leaflense_admin, leaflense_app, leaflense_readonly;
+
+COMMENT ON FUNCTION get_farmer_submission_report(INT)
+    IS 'Fetches the farmer report for a given submission_id, returning NULL for predictions/recommendations while pending or low_confidence.';
+
+-- ============================================================================
 -- FUNCTION 1: get_active_confidence_threshold()
 -- ----------------------------------------------------------------------------
 -- Returns the confidence threshold of the currently active model.
@@ -337,7 +494,7 @@ EXCEPTION
 END;
 $$;
 
-COMMENT ON PROCEDURE submit_leaf_sample(VARCHAR, INET, TEXT)
+COMMENT ON PROCEDURE submit_leaf_sample(VARCHAR, TEXT, INET, TEXT)
     IS 'Creates a new submission with status "pending" and logs the initial status.';
 
 -- ============================================================================
