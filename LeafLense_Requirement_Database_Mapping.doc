@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+<head>
+<meta charset="utf-8">
+<title>LeafLense Requirement & Database Mapping Table</title>
+<!--[if gte mso 9]>
+<xml>
+<w:WordDocument>
+<w:View>Print</w:View>
+<w:Zoom>100</w:Zoom>
+<w:DoNotOptimizeForBrowser/>
+</w:WordDocument>
+</xml>
+<![endif]-->
+<style>
+body {
+    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    color: #222222;
+    margin: 35px;
+}
+h1 {
+    font-size: 20pt;
+    color: #1b5e20;
+    border-bottom: 2.5px solid #2e7d32;
+    padding-bottom: 6px;
+    margin-top: 0;
+}
+h2 {
+    font-size: 14pt;
+    color: #2e7d32;
+    margin-top: 24px;
+    border-bottom: 1px solid #a5d6a7;
+    padding-bottom: 4px;
+}
+p {
+    margin-bottom: 10px;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 15px 0;
+    font-size: 10pt;
+}
+th, td {
+    border: 1px solid #c8e6c9;
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+}
+th {
+    background-color: #2e7d32;
+    color: #ffffff;
+    font-weight: bold;
+}
+tr:nth-child(even) {
+    background-color: #f1f8e9;
+}
+.badge-yes {
+    background-color: #2e7d32;
+    color: #ffffff;
+    font-weight: bold;
+    padding: 2px 7px;
+    border-radius: 3px;
+    display: inline-block;
+    font-size: 9pt;
+}
+.highlight {
+    color: #1b5e20;
+    font-weight: bold;
+}
+.box-summary {
+    background-color: #e8f5e9;
+    border-left: 5px solid #2e7d32;
+    padding: 12px 16px;
+    margin: 18px 0;
+    border-radius: 0 4px 4px 0;
+}
+pre {
+    background-color: #263238;
+    color: #eceff1;
+    padding: 12px;
+    border-radius: 5px;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 9.5pt;
+    line-height: 1.4;
+}
+</style>
+</head>
+<body>
+
+<h1>LeafLense: Requirement & Database Mapping Table</h1>
+<p><strong>System:</strong> LeafLense Crop Leaf Disease Detection System<br>
+<strong>Database Engine:</strong> PostgreSQL 12+ (Tested on PostgreSQL 18)<br>
+<strong>Version:</strong> Updated Edition (Includes Farmer Additional Notes & Admin Expert Guidance)<br>
+<strong>Date:</strong> November 2026</p>
+
+<div class="box-summary">
+<strong>Overview:</strong> This document maps every functional requirement of the LeafLense workflow directly to its corresponding PostgreSQL database tables, columns, stored procedures, and views.
+</div>
+
+<h2>1. Functional Requirements to Database Mapping</h2>
+
+<table>
+<thead>
+<tr>
+    <th style="width: 4%;">#</th>
+    <th style="width: 26%;">Functional Requirement</th>
+    <th style="width: 12%; text-align: center;">Handled in DB?</th>
+    <th style="width: 28%;">Database Tables & Columns</th>
+    <th style="width: 30%;">Stored Logic & Technical Execution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+    <td><strong>1</strong></td>
+    <td><strong>Farmer submits report with leaf image</strong><br>Anonymous upload without prior account registration.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span></td>
+    <td><strong><code>Submissions</code> table:</strong><br>
+    &bull; <code>submission_id</code> (SERIAL PK)<br>
+    &bull; <code>image_path</code> (VARCHAR(500))<br>
+    &bull; <code>submitted_at</code> (TIMESTAMPTZ)<br>
+    &bull; <code>status</code> (submission_status)
+    </td>
+    <td>Handled by procedure: <strong><code>submit_leaf_sample()</code></strong>.<br>
+    Inserts image path, initializes status to <code>'pending'</code>, and logs initial event into <code>SubmissionStatusHistory</code>.</td>
+</tr>
+<tr>
+    <td><strong>2</strong></td>
+    <td><strong>...With additional farmer information / notes</strong><br>Farmer inputs symptom history, duration, or crop details.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span><br><small class="highlight">(Newly Added)</small></td>
+    <td><strong><code>Submissions</code> table:</strong><br>
+    &bull; <strong><code>additional_info</code> (TEXT)</strong></td>
+    <td>Captured via: <strong><code>submit_leaf_sample(..., p_additional_info)</code></strong>.<br>
+    Transferred directly into <code>v_pending_low_confidence_reviews.farmer_additional_info</code> so the specialist can review farmer observations.</td>
+</tr>
+<tr>
+    <td><strong>3</strong></td>
+    <td><strong>Model detects & confidence is HIGH &rarr; shows fault (disease) & recommendations</strong><br>Automated instant diagnosis for confident cases.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span></td>
+    <td>
+    &bull; <strong><code>Predictions</code>:</strong> <code>disease_id</code>, <code>confidence_score</code>, <code>is_top_prediction</code><br>
+    &bull; <strong><code>Models</code>:</strong> <code>confidence_threshold</code><br>
+    &bull; <strong><code>Diseases</code>:</strong> <code>disease_name</code>, <code>description</code>, <code>symptoms</code><br>
+    &bull; <strong><code>Recommendations</code>:</strong> <code>title</code>, <code>description</code>, <code>source</code><br>
+    &bull; <strong><code>DiseaseRecommendations</code>:</strong> M:N links.
+    </td>
+    <td>Handled by procedure: <strong><code>record_prediction()</code></strong>.<br>
+    When <code>confidence_score &gt;= threshold</code>, submission status is auto-updated to <strong><code>'processed'</code></strong>.<br>
+    Farmer frontend queries <strong><code>Diseases</code></strong> and <strong><code>DiseaseRecommendations</code></strong> (Query 4) to immediately render treatment instructions.</td>
+</tr>
+<tr>
+    <td><strong>4</strong></td>
+    <td><strong>If confidence is LOW &rarr; marked pending for human review</strong><br>Uncertain cases are sequestered for specialist triage.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span></td>
+    <td>
+    &bull; <strong><code>Submissions.status</code>:</strong> Set to <code>'low_confidence'</code><br>
+    &bull; <strong><code>SubmissionStatusHistory</code>:</strong> Logs transition <code>pending</code> &rarr; <code>low_confidence</code>.
+    </td>
+    <td>Handled by procedure: <strong><code>record_prediction()</code></strong>.<br>
+    When <code>confidence_score &lt; threshold</code>, auto-routes status to <strong><code>'low_confidence'</code></strong> and creates history audit entries.</td>
+</tr>
+<tr>
+    <td><strong>5</strong></td>
+    <td><strong>Admin can view and assess pending low-confidence records</strong><br>Specialist triage queue dashboard.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span></td>
+    <td>
+    &bull; <strong><code>v_pending_low_confidence_reviews</code> (VIEW)</strong><br>
+    &bull; Joins: <code>Submissions</code>, <code>Predictions</code>, <code>Diseases</code>, <code>Models</code>
+    </td>
+    <td>The View pulls all unreviewed submissions sorted by weakest confidence score first.<br>
+    Exposes: <code>submission_id</code>, <code>image_path</code>, <strong><code>farmer_additional_info</code></strong>, <code>predicted_disease_name</code>, <code>confidence_score</code>, and <code>days_pending</code>.</td>
+</tr>
+<tr>
+    <td><strong>6</strong></td>
+    <td><strong>Admin selects the fault (diagnosed disease)</strong><br>Specialist selects confirmed disease classification.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span></td>
+    <td>
+    &bull; <strong><code>AdminReviews.assessed_disease_id</code>:</strong> FK to <code>Diseases(disease_id)</code><br>
+    &bull; <strong><code>AdminReviews.is_correct</code>:</strong> Boolean verdict.
+    </td>
+    <td>Handled by procedure: <strong><code>review_low_confidence_case(..., p_assessed_disease_id, ...)</code></strong>.<br>
+    Records human diagnosis, changes status to <code>'reviewed'</code>, and records admin identity in <code>SubmissionStatusHistory</code>.</td>
+</tr>
+<tr>
+    <td><strong>7</strong></td>
+    <td><strong>Admin provides recommendation & expert notes</strong><br>System pairs treatments and records custom specialist advice.</td>
+    <td style="text-align: center;"><span class="badge-yes">YES (100%)</span></td>
+    <td>
+    &bull; <strong><code>DiseaseRecommendations</code>:</strong> Automatically retrieves verified recommendations for the selected disease.<br>
+    &bull; <strong><code>AdminReviews.notes</code> (TEXT):</strong> Custom specialist advice and application instructions.
+    </td>
+    <td>Handled by procedure: <strong><code>review_low_confidence_case(..., p_notes)</code></strong>.<br>
+    Selecting the disease auto-links verified treatment steps, while <code>notes</code> captures custom recommendations.</td>
+</tr>
+</tbody>
+</table>
+
+<h2>2. Form Fields & Database Mapping Summary</h2>
+
+<pre>
+[ 1. FARMER UPLOAD FORM ]
+---------------------------------------------------------------------------------
+  UI Field: Leaf Photo Upload          ==> Submissions.image_path (VARCHAR)
+  UI Field: Symptoms & Additional Info ==> Submissions.additional_info (TEXT)
+  Action:   Click "Submit Leaf"        ==> CALL submit_leaf_sample(...)
+---------------------------------------------------------------------------------
+
+[ 2. ADMIN REVIEW FORM (For Low-Confidence Cases) ]
+---------------------------------------------------------------------------------
+  Display:  Leaf Photo + AI Guess + farmer_additional_info (Farmer's notes)
+  UI Field: Diagnosed Disease Dropdown ==> AdminReviews.assessed_disease_id (FK)
+                                           └── Auto-retrieves DiseaseRecommendations!
+  UI Field: Additional Expert Notes    ==> AdminReviews.notes (TEXT)
+  Action:   Click "Submit Assessment"  ==> CALL review_low_confidence_case(...)
+---------------------------------------------------------------------------------
+</pre>
+
+<p style="text-align: center; color: #7f8c8d; font-size: 9pt; margin-top: 35px;">
+LeafLense Database Architecture &bull; Requirements Mapping Reference &bull; PostgreSQL 18
+</p>
+
+</body>
+</html>
