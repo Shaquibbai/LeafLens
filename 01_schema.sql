@@ -12,6 +12,9 @@
 CREATE SCHEMA IF NOT EXISTS leaflense;
 SET search_path = leaflense, public;
 
+-- Password hashing & cryptographic token generation (crypt, gen_salt, gen_random_bytes, digest)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- ============================================================================
 -- 2. CUSTOM ENUM TYPES
 -- ============================================================================
@@ -28,12 +31,10 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Roles assignable to administrative users
+-- Role assignable to administrative users (only 'admin')
 DO $$ BEGIN
     CREATE TYPE admin_role AS ENUM (
-        'super_admin',      -- full system access
-        'reviewer',         -- can review low-confidence submissions
-        'analyst'           -- read-only analytics access
+        'admin'             -- reviews low-confidence submissions
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -45,10 +46,18 @@ DO $$ BEGIN
         'UPDATE',
         'DELETE',
         'STATUS_CHANGE',
-        'BULK_UPDATE'
+        'BULK_UPDATE',
+        'LOGIN',
+        'LOGOUT',
+        'LOGIN_FAILED'
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+
+-- Ensure auth audit actions exist when upgrading an existing schema
+ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'LOGIN';
+ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'LOGOUT';
+ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'LOGIN_FAILED';
 
 -- ============================================================================
 -- 3. DATABASE ROLES
@@ -68,13 +77,6 @@ DO $$ BEGIN
     END IF;
 END $$;
 
--- leaflense_readonly – read-only analytics access
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'leaflense_readonly') THEN
-        CREATE ROLE leaflense_readonly LOGIN PASSWORD 'readonly_pass';
-    END IF;
-END $$;
-
 -- ============================================================================
 -- 4. TABLE DEFINITIONS
 -- ============================================================================
@@ -83,20 +85,64 @@ END $$;
 -- 4a. AdminUsers – administrators who review low-confidence cases
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS AdminUsers (
-    admin_id        SERIAL          PRIMARY KEY,
-    username        VARCHAR(100)    UNIQUE NOT NULL,
-    password_hash   VARCHAR(255)    NOT NULL,
-    role            admin_role      NOT NULL DEFAULT 'reviewer',
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    is_active       BOOLEAN         NOT NULL DEFAULT TRUE
+    admin_id                SERIAL          PRIMARY KEY,
+    username                VARCHAR(100)    UNIQUE NOT NULL,
+    password_hash           VARCHAR(255)    NOT NULL,
+    full_name               VARCHAR(150),
+    email                   VARCHAR(255),
+    role                    admin_role      NOT NULL DEFAULT 'admin',
+    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    last_login_at           TIMESTAMPTZ,
+    failed_login_attempts   INT             NOT NULL DEFAULT 0,
+    locked_until            TIMESTAMPTZ,
+    is_active               BOOLEAN         NOT NULL DEFAULT TRUE
 );
 
-COMMENT ON TABLE  AdminUsers              IS 'Platform administrators who can review submissions.';
-COMMENT ON COLUMN AdminUsers.admin_id     IS 'Auto-generated primary key.';
-COMMENT ON COLUMN AdminUsers.username     IS 'Unique login name.';
-COMMENT ON COLUMN AdminUsers.password_hash IS 'Bcrypt / argon2 hash of the password.';
-COMMENT ON COLUMN AdminUsers.role         IS 'Permission level: super_admin, reviewer, or analyst.';
-COMMENT ON COLUMN AdminUsers.is_active    IS 'Soft-delete flag; FALSE disables login.';
+-- Idempotent column upgrades for existing installations
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS full_name VARCHAR(150);
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS failed_login_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+
+COMMENT ON TABLE  AdminUsers                        IS 'Platform administrators who can log in and review low-confidence submissions.';
+COMMENT ON COLUMN AdminUsers.admin_id               IS 'Auto-generated primary key.';
+COMMENT ON COLUMN AdminUsers.username               IS 'Unique login name.';
+COMMENT ON COLUMN AdminUsers.password_hash          IS 'Bcrypt hash of the password (compatible with pgcrypto crypt/gen_salt).';
+COMMENT ON COLUMN AdminUsers.full_name              IS 'Display name shown in the admin dashboard after login.';
+COMMENT ON COLUMN AdminUsers.email                  IS 'Optional administrator contact email.';
+COMMENT ON COLUMN AdminUsers.role                   IS 'Administrative role: admin.';
+COMMENT ON COLUMN AdminUsers.last_login_at          IS 'Timestamp of the most recent successful admin login.';
+COMMENT ON COLUMN AdminUsers.failed_login_attempts  IS 'Consecutive failed login count used for temporary lockout.';
+COMMENT ON COLUMN AdminUsers.locked_until           IS 'Temporary lockout expiry timestamp after repeated failed logins.';
+COMMENT ON COLUMN AdminUsers.is_active              IS 'Soft-delete flag; FALSE disables login.';
+
+-- ============================================================================
+-- 4a-2. AdminSessions – active authenticated admin sessions
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS AdminSessions (
+    session_id          SERIAL          PRIMARY KEY,
+    admin_id            INT             NOT NULL
+                        REFERENCES AdminUsers (admin_id) ON DELETE CASCADE,
+    token_hash          VARCHAR(64)     UNIQUE NOT NULL,
+    ip_address          INET,
+    user_agent          TEXT,
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    last_activity_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    expires_at          TIMESTAMPTZ     NOT NULL,
+    is_revoked          BOOLEAN         NOT NULL DEFAULT FALSE
+);
+
+COMMENT ON TABLE  AdminSessions             IS 'Server-side session tokens issued when an admin logs in via username/password.';
+COMMENT ON COLUMN AdminSessions.token_hash  IS 'SHA-256 hex digest of the opaque session token returned to the client.';
+COMMENT ON COLUMN AdminSessions.expires_at  IS 'Session expiration timestamp.';
+COMMENT ON COLUMN AdminSessions.is_revoked  IS 'TRUE when the admin logs out or the session is invalidated.';
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin
+    ON AdminSessions (admin_id);
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_active
+    ON AdminSessions (token_hash)
+    WHERE is_revoked = FALSE;
 
 -- ============================================================================
 -- 4b. Models – ML models used for leaf disease classification
@@ -303,7 +349,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_created
 -- ============================================================================
 
 -- Schema-level access
-GRANT USAGE ON SCHEMA leaflense TO leaflense_admin, leaflense_app, leaflense_readonly;
+GRANT USAGE ON SCHEMA leaflense TO leaflense_admin, leaflense_app;
 
 -- ---- leaflense_admin: full access ----
 GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA leaflense TO leaflense_admin;
@@ -316,8 +362,16 @@ GRANT SELECT, INSERT, UPDATE
 
 GRANT SELECT
     ON Diseases, Models, ModelClasses, Recommendations,
-       DiseaseRecommendations, AdminUsers, AdminReviews
+       DiseaseRecommendations, AdminReviews
     TO leaflense_app;
+
+-- Protect password_hash from direct SELECT by the application role;
+-- authentication runs through SECURITY DEFINER functions (login_admin, verify_admin_session).
+REVOKE ALL ON AdminUsers FROM leaflense_app;
+GRANT SELECT (admin_id, username, full_name, email, role, created_at, last_login_at, is_active)
+    ON AdminUsers TO leaflense_app;
+
+REVOKE ALL ON AdminSessions FROM leaflense_app;
 
 GRANT USAGE ON SEQUENCE submissions_submission_id_seq,
                         predictions_prediction_id_seq,
@@ -325,14 +379,9 @@ GRANT USAGE ON SEQUENCE submissions_submission_id_seq,
                         auditlogs_audit_id_seq
     TO leaflense_app;
 
--- ---- leaflense_readonly: SELECT only ----
-GRANT SELECT ON ALL TABLES IN SCHEMA leaflense TO leaflense_readonly;
-
 -- Future tables inherit the same grants
 ALTER DEFAULT PRIVILEGES IN SCHEMA leaflense
     GRANT ALL ON TABLES TO leaflense_admin;
-ALTER DEFAULT PRIVILEGES IN SCHEMA leaflense
-    GRANT SELECT ON TABLES TO leaflense_readonly;
 
 -- ============================================================================
 -- END OF FILE

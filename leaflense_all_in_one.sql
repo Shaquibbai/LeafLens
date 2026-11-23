@@ -12,6 +12,9 @@
 CREATE SCHEMA IF NOT EXISTS leaflense;
 SET search_path = leaflense, public;
 
+-- Password hashing & cryptographic token generation (crypt, gen_salt, gen_random_bytes, digest)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- ============================================================================
 -- 2. CUSTOM ENUM TYPES
 -- ============================================================================
@@ -28,9 +31,7 @@ END $$;
 
 DO $$ BEGIN
     CREATE TYPE admin_role AS ENUM (
-        'super_admin',
-        'reviewer',
-        'analyst'
+        'admin'
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -41,10 +42,17 @@ DO $$ BEGIN
         'UPDATE',
         'DELETE',
         'STATUS_CHANGE',
-        'BULK_UPDATE'
+        'BULK_UPDATE',
+        'LOGIN',
+        'LOGOUT',
+        'LOGIN_FAILED'
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+
+ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'LOGIN';
+ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'LOGOUT';
+ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'LOGIN_FAILED';
 
 -- ============================================================================
 -- 3. ROLES SETUP
@@ -61,24 +69,44 @@ DO $$ BEGIN
     END IF;
 END $$;
 
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'leaflense_readonly') THEN
-        CREATE ROLE leaflense_readonly LOGIN PASSWORD 'readonly_pass';
-    END IF;
-END $$;
-
 -- ============================================================================
--- 4. TABLES (11 TABLES)
+-- 4. TABLES (12 TABLES)
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS AdminUsers (
-    admin_id        SERIAL          PRIMARY KEY,
-    username        VARCHAR(100)    UNIQUE NOT NULL,
-    password_hash   VARCHAR(255)    NOT NULL,
-    role            admin_role      NOT NULL DEFAULT 'reviewer',
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    is_active       BOOLEAN         NOT NULL DEFAULT TRUE
+    admin_id                SERIAL          PRIMARY KEY,
+    username                VARCHAR(100)    UNIQUE NOT NULL,
+    password_hash           VARCHAR(255)    NOT NULL,
+    full_name               VARCHAR(150),
+    email                   VARCHAR(255),
+    role                    admin_role      NOT NULL DEFAULT 'admin',
+    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    last_login_at           TIMESTAMPTZ,
+    failed_login_attempts   INT             NOT NULL DEFAULT 0,
+    locked_until            TIMESTAMPTZ,
+    is_active               BOOLEAN         NOT NULL DEFAULT TRUE
 );
+
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS full_name VARCHAR(150);
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS failed_login_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE AdminUsers ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS AdminSessions (
+    session_id          SERIAL          PRIMARY KEY,
+    admin_id            INT             NOT NULL REFERENCES AdminUsers (admin_id) ON DELETE CASCADE,
+    token_hash          VARCHAR(64)     UNIQUE NOT NULL,
+    ip_address          INET,
+    user_agent          TEXT,
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    last_activity_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    expires_at          TIMESTAMPTZ     NOT NULL,
+    is_revoked          BOOLEAN         NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin ON AdminSessions (admin_id);
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_active ON AdminSessions (token_hash) WHERE is_revoked = FALSE;
 
 CREATE TABLE IF NOT EXISTS Models (
     model_id                SERIAL          PRIMARY KEY,
@@ -190,15 +218,308 @@ CREATE INDEX IF NOT EXISTS idx_audit_created ON AuditLogs (created_at DESC);
 -- ============================================================================
 -- 5. GRANTS & PERMISSIONS
 -- ============================================================================
-GRANT USAGE ON SCHEMA leaflense TO leaflense_admin, leaflense_app, leaflense_readonly;
+GRANT USAGE ON SCHEMA leaflense TO leaflense_admin, leaflense_app;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA leaflense TO leaflense_admin;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leaflense TO leaflense_admin;
 
 GRANT SELECT, INSERT, UPDATE ON Submissions, Predictions, SubmissionStatusHistory, AuditLogs TO leaflense_app;
-GRANT SELECT ON Diseases, Models, ModelClasses, Recommendations, DiseaseRecommendations, AdminUsers, AdminReviews TO leaflense_app;
+GRANT SELECT ON Diseases, Models, ModelClasses, Recommendations, DiseaseRecommendations, AdminReviews TO leaflense_app;
+
+-- Protect password_hash and AdminSessions from direct SELECT by app role
+REVOKE ALL ON AdminUsers FROM leaflense_app;
+GRANT SELECT (admin_id, username, full_name, email, role, created_at, last_login_at, is_active)
+    ON AdminUsers TO leaflense_app;
+REVOKE ALL ON AdminSessions FROM leaflense_app;
+
 GRANT USAGE ON SEQUENCE submissions_submission_id_seq, predictions_prediction_id_seq, submissionstatushistory_history_id_seq, auditlogs_audit_id_seq TO leaflense_app;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA leaflense TO leaflense_readonly;
+-- Clean up any previously removed analytics / super_admin functions if upgrading
+DROP FUNCTION IF EXISTS calculate_model_performance(INT);
+DROP FUNCTION IF EXISTS calculate_model_performance(INT, TEXT);
+DROP FUNCTION IF EXISTS get_disease_statistics(TIMESTAMPTZ, TIMESTAMPTZ);
+DROP FUNCTION IF EXISTS get_disease_statistics(TIMESTAMPTZ, TIMESTAMPTZ, TEXT);
+DROP FUNCTION IF EXISTS get_active_confidence_threshold();
+DROP FUNCTION IF EXISTS get_active_confidence_threshold(TEXT);
+DROP FUNCTION IF EXISTS create_admin_user(VARCHAR, TEXT, admin_role, VARCHAR, VARCHAR, TEXT);
+DROP FUNCTION IF EXISTS change_admin_password(INT, TEXT, TEXT, TEXT);
+DROP FUNCTION IF EXISTS set_admin_active_status(INT, BOOLEAN, TEXT);
+DROP FUNCTION IF EXISTS get_admin_users(TEXT);
+DROP FUNCTION IF EXISTS update_model_config(INT, NUMERIC, BOOLEAN, TEXT);
+DROP FUNCTION IF EXISTS get_audit_logs(INT, VARCHAR, TEXT);
+DROP FUNCTION IF EXISTS fn_require_admin_privilege(admin_role[], TEXT);
+
+-- ============================================================================
+-- 5a. FRONTEND INTEGRATION: ADMIN AUTHENTICATION & PRIVILEGE HELPERS
+-- ============================================================================
+
+DROP VIEW IF EXISTS v_admin_users_public CASCADE;
+
+CREATE OR REPLACE VIEW v_admin_users_public AS
+SELECT admin_id, username, full_name, email, role, is_active, last_login_at, created_at
+FROM AdminUsers;
+
+GRANT SELECT ON v_admin_users_public TO leaflense_admin, leaflense_app;
+
+DROP FUNCTION IF EXISTS fn_get_role_privileges(admin_role);
+
+CREATE OR REPLACE FUNCTION fn_get_role_privileges(p_role admin_role)
+RETURNS JSONB
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE p_role
+        WHEN 'admin' THEN jsonb_build_object(
+            'can_view_pending_reviews',  TRUE,
+            'can_review_low_confidence', TRUE,
+            'can_reject_submissions',    TRUE
+        )
+    END;
+$$;
+
+GRANT EXECUTE ON FUNCTION fn_get_role_privileges(admin_role) TO leaflense_admin, leaflense_app;
+
+DROP FUNCTION IF EXISTS fn_require_admin_privilege(TEXT);
+
+CREATE OR REPLACE FUNCTION fn_require_admin_privilege(
+    p_session_token TEXT DEFAULT NULL
+)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = leaflense, public
+AS $$
+DECLARE
+    v_token         TEXT;
+    v_token_hash    VARCHAR(64);
+    v_admin_id      INT;
+    v_username      VARCHAR(100);
+    v_role          admin_role;
+BEGIN
+    v_token := COALESCE(
+        NULLIF(TRIM(p_session_token), ''),
+        NULLIF(TRIM(current_setting('leaflense.session_token', true)), '')
+    );
+
+    IF v_token IS NOT NULL THEN
+        v_token_hash := encode(digest(v_token, 'sha256'), 'hex');
+
+        SELECT s.admin_id, u.username, u.role
+          INTO v_admin_id, v_username, v_role
+          FROM AdminSessions s
+          INNER JOIN AdminUsers u ON u.admin_id = s.admin_id
+         WHERE s.token_hash = v_token_hash
+           AND s.is_revoked = FALSE
+           AND s.expires_at > NOW()
+           AND u.is_active  = TRUE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Access denied: invalid or expired admin session.';
+        END IF;
+
+        IF v_role <> 'admin' THEN
+            RAISE EXCEPTION 'Access denied: admin role required.';
+        END IF;
+
+        UPDATE AdminSessions SET last_activity_at = NOW() WHERE token_hash = v_token_hash;
+        PERFORM set_config('leaflense.current_admin', v_username, true);
+        RETURN v_admin_id;
+    END IF;
+
+    IF pg_has_role(current_user, 'leaflense_admin', 'MEMBER')
+       OR current_user = 'leaflense_admin'
+       OR current_user = 'postgres' THEN
+        RETURN NULL;
+    END IF;
+
+    RAISE EXCEPTION 'Access denied: admin login required. Current user: %', current_user;
+END;
+$$;
+
+ALTER FUNCTION fn_require_admin_privilege(TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON FUNCTION fn_require_admin_privilege(TEXT) TO leaflense_admin, leaflense_app;
+
+DROP FUNCTION IF EXISTS login_admin(VARCHAR, TEXT, INET, TEXT);
+
+CREATE OR REPLACE FUNCTION login_admin(
+    p_username   VARCHAR,
+    p_password   TEXT,
+    p_ip_address INET DEFAULT NULL,
+    p_user_agent TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+    authenticated  BOOLEAN,
+    admin_id       INT,
+    username       VARCHAR,
+    full_name      VARCHAR,
+    role           admin_role,
+    privileges     JSONB,
+    session_token  TEXT,
+    expires_at     TIMESTAMPTZ,
+    message        TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = leaflense, public
+AS $$
+DECLARE
+    v_user            AdminUsers%ROWTYPE;
+    v_clean_username  VARCHAR(100);
+    v_password_match  BOOLEAN := FALSE;
+    v_raw_token       TEXT;
+    v_token_hash      VARCHAR(64);
+    v_expires_at      TIMESTAMPTZ;
+    v_attempts        INT;
+BEGIN
+    v_clean_username := TRIM(COALESCE(p_username, ''));
+
+    IF v_clean_username = '' OR COALESCE(p_password, '') = '' THEN
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TEXT, NULL::TIMESTAMPTZ, 'Username and password are required.'::TEXT;
+        RETURN;
+    END IF;
+
+    SELECT * INTO v_user FROM AdminUsers u WHERE u.username = v_clean_username;
+
+    IF NOT FOUND THEN
+        INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
+        VALUES (v_clean_username, 'LOGIN_FAILED', 'admin_users', NULL, jsonb_build_object('reason', 'unknown_username', 'ip_address', p_ip_address));
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TEXT, NULL::TIMESTAMPTZ, 'Invalid username or password.'::TEXT;
+        RETURN;
+    END IF;
+
+    IF v_user.is_active = FALSE THEN
+        INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
+        VALUES (v_user.username, 'LOGIN_FAILED', 'admin_users', v_user.admin_id, jsonb_build_object('reason', 'account_inactive', 'ip_address', p_ip_address));
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TEXT, NULL::TIMESTAMPTZ, 'Account is deactivated. Contact a super administrator.'::TEXT;
+        RETURN;
+    END IF;
+
+    IF v_user.locked_until IS NOT NULL AND v_user.locked_until > NOW() THEN
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TEXT, NULL::TIMESTAMPTZ, 'Account temporarily locked due to too many failed login attempts. Try again later.'::TEXT;
+        RETURN;
+    END IF;
+
+    BEGIN
+        v_password_match := (crypt(p_password, v_user.password_hash) = v_user.password_hash);
+    EXCEPTION WHEN OTHERS THEN
+        v_password_match := FALSE;
+    END;
+
+    IF NOT COALESCE(v_password_match, FALSE) THEN
+        v_attempts := COALESCE(v_user.failed_login_attempts, 0) + 1;
+        UPDATE AdminUsers
+           SET failed_login_attempts = v_attempts,
+               locked_until = CASE WHEN v_attempts >= 5 THEN NOW() + INTERVAL '15 minutes' ELSE NULL END
+         WHERE AdminUsers.admin_id = v_user.admin_id;
+        INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
+        VALUES (v_user.username, 'LOGIN_FAILED', 'admin_users', v_user.admin_id, jsonb_build_object('reason', 'invalid_password', 'attempt', v_attempts, 'ip_address', p_ip_address));
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TEXT, NULL::TIMESTAMPTZ, 'Invalid username or password.'::TEXT;
+        RETURN;
+    END IF;
+
+    UPDATE AdminUsers SET failed_login_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE AdminUsers.admin_id = v_user.admin_id;
+
+    v_raw_token  := encode(gen_random_bytes(32), 'hex');
+    v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
+    v_expires_at := NOW() + INTERVAL '12 hours';
+
+    INSERT INTO AdminSessions (admin_id, token_hash, ip_address, user_agent, expires_at)
+    VALUES (v_user.admin_id, v_token_hash, p_ip_address, p_user_agent, v_expires_at);
+
+    INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
+    VALUES (v_user.username, 'LOGIN', 'admin_users', v_user.admin_id, jsonb_build_object('role', v_user.role, 'ip_address', p_ip_address));
+
+    RETURN QUERY SELECT TRUE, v_user.admin_id, v_user.username, v_user.full_name, v_user.role, fn_get_role_privileges(v_user.role), v_raw_token, v_expires_at, 'Login successful.'::TEXT;
+END;
+$$;
+
+ALTER FUNCTION login_admin(VARCHAR, TEXT, INET, TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON FUNCTION login_admin(VARCHAR, TEXT, INET, TEXT) TO leaflense_admin, leaflense_app;
+
+DROP FUNCTION IF EXISTS verify_admin_session(TEXT);
+
+CREATE OR REPLACE FUNCTION verify_admin_session(p_session_token TEXT)
+RETURNS TABLE (
+    is_valid    BOOLEAN,
+    admin_id    INT,
+    username    VARCHAR,
+    full_name   VARCHAR,
+    role        admin_role,
+    privileges  JSONB,
+    expires_at  TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = leaflense, public
+AS $$
+DECLARE
+    v_token_hash VARCHAR(64);
+    v_rec        RECORD;
+BEGIN
+    IF NULLIF(TRIM(COALESCE(p_session_token, '')), '') IS NULL THEN
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TIMESTAMPTZ;
+        RETURN;
+    END IF;
+
+    v_token_hash := encode(digest(TRIM(p_session_token), 'sha256'), 'hex');
+
+    SELECT u.admin_id, u.username, u.full_name, u.role, s.expires_at
+      INTO v_rec
+      FROM AdminSessions s
+      INNER JOIN AdminUsers u ON u.admin_id = s.admin_id
+     WHERE s.token_hash = v_token_hash AND s.is_revoked = FALSE AND s.expires_at > NOW() AND u.is_active = TRUE;
+
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT FALSE, NULL::INT, NULL::VARCHAR, NULL::VARCHAR, NULL::admin_role, NULL::JSONB, NULL::TIMESTAMPTZ;
+        RETURN;
+    END IF;
+
+    UPDATE AdminSessions SET last_activity_at = NOW() WHERE token_hash = v_token_hash;
+    RETURN QUERY SELECT TRUE, v_rec.admin_id, v_rec.username, v_rec.full_name, v_rec.role, fn_get_role_privileges(v_rec.role), v_rec.expires_at;
+END;
+$$;
+
+ALTER FUNCTION verify_admin_session(TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON FUNCTION verify_admin_session(TEXT) TO leaflense_admin, leaflense_app;
+
+DROP FUNCTION IF EXISTS logout_admin(TEXT);
+
+CREATE OR REPLACE FUNCTION logout_admin(p_session_token TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = leaflense, public
+AS $$
+DECLARE
+    v_token_hash VARCHAR(64);
+    v_admin_id   INT;
+    v_username   VARCHAR(100);
+BEGIN
+    IF NULLIF(TRIM(COALESCE(p_session_token, '')), '') IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    v_token_hash := encode(digest(TRIM(p_session_token), 'sha256'), 'hex');
+
+    UPDATE AdminSessions s SET is_revoked = TRUE
+      FROM AdminUsers u
+     WHERE s.admin_id = u.admin_id AND s.token_hash = v_token_hash AND s.is_revoked = FALSE
+     RETURNING s.admin_id, u.username INTO v_admin_id, v_username;
+
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+
+    INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
+    VALUES (v_username, 'LOGOUT', 'admin_sessions', v_admin_id, jsonb_build_object('revoked', TRUE));
+
+    RETURN TRUE;
+END;
+$$;
+
+ALTER FUNCTION logout_admin(TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON FUNCTION logout_admin(TEXT) TO leaflense_admin, leaflense_app;
+
+-- ============================================================================
 
 -- ============================================================================
 -- 5b. FRONTEND INTEGRATION: PENDING LOW-CONFIDENCE VIEW & FUNCTION
@@ -237,13 +558,16 @@ WHERE
 ORDER BY
     p.confidence_score ASC;
 
-GRANT SELECT ON v_pending_low_confidence_reviews TO leaflense_admin, leaflense_app, leaflense_readonly;
+GRANT SELECT ON v_pending_low_confidence_reviews TO leaflense_admin, leaflense_app;
 
 COMMENT ON VIEW v_pending_low_confidence_reviews
     IS 'Powers the frontend admin dashboard tab showing all pending low-confidence submissions with farmer notes, sorted by lowest score first.';
 
--- Dedicated function returning the same dataset (for backends that call functions)
-CREATE OR REPLACE FUNCTION get_pending_low_confidence_submissions()
+-- Dedicated function returning the same dataset (admin-privileged)
+DROP FUNCTION IF EXISTS get_pending_low_confidence_submissions();
+DROP FUNCTION IF EXISTS get_pending_low_confidence_submissions(TEXT);
+
+CREATE OR REPLACE FUNCTION get_pending_low_confidence_submissions(p_session_token TEXT DEFAULT NULL)
 RETURNS TABLE (
     submission_id           INT,
     image_path              VARCHAR,
@@ -260,29 +584,35 @@ RETURNS TABLE (
     threshold_gap           NUMERIC(5,4),
     days_pending            INT
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = leaflense, public
 AS $$
+BEGIN
+    PERFORM fn_require_admin_privilege(p_session_token);
+
+    RETURN QUERY
     SELECT
-        submission_id,
-        image_path,
-        farmer_additional_info,
-        submitted_at,
-        status,
-        prediction_id,
-        predicted_disease_id,
-        predicted_disease_name,
-        confidence_score,
-        model_name,
-        model_version,
-        confidence_threshold,
-        threshold_gap,
-        days_pending
-    FROM v_pending_low_confidence_reviews;
+        v.submission_id,
+        v.image_path,
+        v.farmer_additional_info,
+        v.submitted_at,
+        v.status,
+        v.prediction_id,
+        v.predicted_disease_id,
+        v.predicted_disease_name,
+        v.confidence_score,
+        v.model_name,
+        v.model_version,
+        v.confidence_threshold,
+        v.threshold_gap,
+        v.days_pending
+    FROM v_pending_low_confidence_reviews v;
+END;
 $$;
 
-GRANT EXECUTE ON FUNCTION get_pending_low_confidence_submissions() TO leaflense_admin, leaflense_app, leaflense_readonly;
+ALTER FUNCTION get_pending_low_confidence_submissions(TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON FUNCTION get_pending_low_confidence_submissions(TEXT) TO leaflense_admin, leaflense_app;
 
 -- ============================================================================
 -- 5c. FRONTEND INTEGRATION: FARMER SUBMISSION REPORT VIEW & FUNCTION
@@ -384,7 +714,7 @@ FROM
         WHERE dr.disease_id = d.disease_id
     ) rec ON d.disease_id IS NOT NULL;
 
-GRANT SELECT ON v_farmer_submission_reports TO leaflense_admin, leaflense_app, leaflense_readonly;
+GRANT SELECT ON v_farmer_submission_reports TO leaflense_admin, leaflense_app;
 
 COMMENT ON VIEW v_farmer_submission_reports
     IS 'Returns farmer-facing submission reports; hides predictions and recommendations as NULL with status "pending" until high-confidence processing or admin review completes.';
@@ -433,142 +763,11 @@ AS $$
     WHERE submission_id = p_submission_id;
 $$;
 
-GRANT EXECUTE ON FUNCTION get_farmer_submission_report(INT) TO leaflense_admin, leaflense_app, leaflense_readonly;
+ALTER FUNCTION get_farmer_submission_report(INT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON FUNCTION get_farmer_submission_report(INT) TO leaflense_admin, leaflense_app;
 
 COMMENT ON FUNCTION get_farmer_submission_report(INT)
     IS 'Fetches the farmer report for a given submission_id, returning NULL for predictions/recommendations while pending or low_confidence.';
-
--- ============================================================================
--- 6. FUNCTIONS (ADMIN-RESTRICTED)
--- ============================================================================
-CREATE OR REPLACE FUNCTION get_active_confidence_threshold()
-RETURNS NUMERIC(5,4)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = leaflense, public
-AS $$
-DECLARE
-    v_threshold NUMERIC(5,4);
-BEGIN
-    IF NOT pg_has_role(current_user, 'leaflense_admin', 'MEMBER')
-       AND current_user <> 'leaflense_admin'
-       AND current_user <> 'postgres' THEN
-        RAISE EXCEPTION 'Access denied: admin role required. Current user: %', current_user;
-    END IF;
-
-    SELECT MIN(confidence_threshold) INTO v_threshold
-      FROM Models
-     WHERE is_active = TRUE;
-
-    IF v_threshold IS NULL THEN
-        RAISE EXCEPTION 'No active model found. Please activate a model first.';
-    END IF;
-
-    RETURN v_threshold;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION calculate_model_performance(p_model_id INT)
-RETURNS TABLE (
-    total_predictions       BIGINT,
-    verified_predictions    BIGINT,
-    correct_predictions     BIGINT,
-    accuracy                NUMERIC(5,2),
-    avg_confidence          NUMERIC(5,4)
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = leaflense, public
-AS $$
-BEGIN
-    IF NOT pg_has_role(current_user, 'leaflense_admin', 'MEMBER')
-       AND current_user <> 'leaflense_admin'
-       AND current_user <> 'postgres' THEN
-        RAISE EXCEPTION 'Access denied: admin role required. Current user: %', current_user;
-    END IF;
-
-    IF NOT EXISTS (SELECT 1 FROM Models WHERE model_id = p_model_id) THEN
-        RAISE EXCEPTION 'Model with ID % does not exist.', p_model_id;
-    END IF;
-
-    RETURN QUERY
-    SELECT
-        COUNT(*)::BIGINT                                            AS total_predictions,
-        COUNT(ar.review_id)::BIGINT                                 AS verified_predictions,
-        COUNT(CASE WHEN ar.is_correct = TRUE THEN 1 END)::BIGINT   AS correct_predictions,
-        CASE
-            WHEN COUNT(ar.review_id) = 0 THEN 0.00
-            ELSE ROUND(
-                COUNT(CASE WHEN ar.is_correct = TRUE THEN 1 END)::NUMERIC
-                / COUNT(ar.review_id) * 100,
-                2
-            )
-        END                                                         AS accuracy,
-        ROUND(AVG(p.confidence_score), 4)                           AS avg_confidence
-    FROM Predictions p
-    LEFT JOIN AdminReviews ar ON ar.submission_id = p.submission_id
-    WHERE p.model_id = p_model_id
-      AND p.is_top_prediction = TRUE;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION get_disease_statistics(
-    p_start_date TIMESTAMPTZ DEFAULT NULL,
-    p_end_date   TIMESTAMPTZ DEFAULT NULL
-)
-RETURNS TABLE (
-    disease_id              INT,
-    disease_name            VARCHAR,
-    total_cases             BIGINT,
-    avg_confidence          NUMERIC(5,4),
-    high_confidence_cases   BIGINT,
-    low_confidence_cases    BIGINT,
-    reviewed_cases          BIGINT,
-    first_detected          TIMESTAMPTZ,
-    last_detected           TIMESTAMPTZ
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = leaflense, public
-AS $$
-DECLARE
-    v_threshold NUMERIC(5,4);
-BEGIN
-    IF NOT pg_has_role(current_user, 'leaflense_admin', 'MEMBER')
-       AND current_user <> 'leaflense_admin'
-       AND current_user <> 'postgres' THEN
-        RAISE EXCEPTION 'Access denied: admin role required. Current user: %', current_user;
-    END IF;
-
-    SELECT MIN(confidence_threshold) INTO v_threshold
-      FROM Models
-     WHERE is_active = TRUE;
-
-    IF v_threshold IS NULL THEN
-        v_threshold := 0.7500;
-    END IF;
-
-    RETURN QUERY
-    SELECT
-        d.disease_id,
-        d.disease_name,
-        COUNT(*)::BIGINT                        AS total_cases,
-        ROUND(AVG(p.confidence_score), 4)       AS avg_confidence,
-        COUNT(*) FILTER (WHERE p.confidence_score >= v_threshold)::BIGINT AS high_confidence_cases,
-        COUNT(*) FILTER (WHERE p.confidence_score < v_threshold)::BIGINT  AS low_confidence_cases,
-        COUNT(DISTINCT ar.review_id)::BIGINT    AS reviewed_cases,
-        MIN(p.predicted_at)                     AS first_detected,
-        MAX(p.predicted_at)                     AS last_detected
-    FROM Predictions p
-    INNER JOIN Diseases d ON d.disease_id = p.disease_id
-    LEFT JOIN AdminReviews ar ON ar.submission_id = p.submission_id
-    WHERE p.is_top_prediction = TRUE
-      AND (p_start_date IS NULL OR p.predicted_at >= p_start_date)
-      AND (p_end_date   IS NULL OR p.predicted_at <= p_end_date)
-    GROUP BY d.disease_id, d.disease_name
-    ORDER BY total_cases DESC;
-END;
-$$;
 
 -- ============================================================================
 -- 7. PROCEDURES
@@ -581,6 +780,7 @@ CREATE OR REPLACE PROCEDURE submit_leaf_sample(
     IN  p_user_agent       TEXT        DEFAULT NULL
 )
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = leaflense, public
 AS $$
 BEGIN
@@ -597,6 +797,9 @@ BEGIN
 END;
 $$;
 
+ALTER PROCEDURE submit_leaf_sample(VARCHAR, TEXT, INET, TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON PROCEDURE submit_leaf_sample(VARCHAR, TEXT, INET, TEXT) TO leaflense_admin, leaflense_app;
+
 CREATE OR REPLACE PROCEDURE record_prediction(
     IN p_submission_id      INT,
     IN p_model_id           INT,
@@ -605,6 +808,7 @@ CREATE OR REPLACE PROCEDURE record_prediction(
     IN p_is_top_prediction  BOOLEAN DEFAULT FALSE
 )
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = leaflense, public
 AS $$
 DECLARE
@@ -655,21 +859,46 @@ BEGIN
 END;
 $$;
 
+ALTER PROCEDURE record_prediction(INT, INT, INT, NUMERIC, BOOLEAN) OWNER TO leaflense_admin;
+GRANT EXECUTE ON PROCEDURE record_prediction(INT, INT, INT, NUMERIC, BOOLEAN) TO leaflense_admin, leaflense_app;
+
+DROP PROCEDURE IF EXISTS review_low_confidence_case(INT, INT, INT, BOOLEAN, TEXT);
+DROP PROCEDURE IF EXISTS review_low_confidence_case(INT, INT, INT, BOOLEAN, TEXT, TEXT);
+
 CREATE OR REPLACE PROCEDURE review_low_confidence_case(
     IN p_submission_id       INT,
-    IN p_admin_id            INT,
+    IN p_admin_id            INT     DEFAULT NULL,
     IN p_assessed_disease_id INT     DEFAULT NULL,
     IN p_is_correct          BOOLEAN DEFAULT NULL,
-    IN p_notes               TEXT    DEFAULT NULL
+    IN p_notes               TEXT    DEFAULT NULL,
+    IN p_session_token       TEXT    DEFAULT NULL
 )
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = leaflense, public
 AS $$
 DECLARE
+    v_auth_admin_id     INT;
+    v_effective_admin   INT;
     v_current_status    submission_status;
     v_admin_username    VARCHAR(100);
+    v_admin_role        admin_role;
     v_review_id         INT;
 BEGIN
+    v_auth_admin_id := fn_require_admin_privilege(p_session_token);
+
+    IF v_auth_admin_id IS NOT NULL THEN
+        IF p_admin_id IS NOT NULL AND p_admin_id <> v_auth_admin_id THEN
+            RAISE EXCEPTION 'Session admin (%) does not match provided p_admin_id (%).', v_auth_admin_id, p_admin_id;
+        END IF;
+        v_effective_admin := v_auth_admin_id;
+    ELSE
+        IF p_admin_id IS NULL THEN
+            RAISE EXCEPTION 'p_admin_id is required when calling without an admin session token.';
+        END IF;
+        v_effective_admin := p_admin_id;
+    END IF;
+
     SELECT status INTO v_current_status FROM Submissions WHERE submission_id = p_submission_id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Submission % does not exist.', p_submission_id;
@@ -679,10 +908,12 @@ BEGIN
         RAISE EXCEPTION 'Submission % has status "%" – only "low_confidence" submissions can be reviewed.', p_submission_id, v_current_status;
     END IF;
 
-    SELECT username INTO v_admin_username FROM AdminUsers WHERE admin_id = p_admin_id AND is_active = TRUE;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Admin % does not exist or is inactive.', p_admin_id;
+    SELECT username, role INTO v_admin_username, v_admin_role FROM AdminUsers WHERE admin_id = v_effective_admin AND is_active = TRUE;
+    IF NOT FOUND OR v_admin_role <> 'admin' THEN
+        RAISE EXCEPTION 'Admin % does not exist or is inactive.', v_effective_admin;
     END IF;
+
+    PERFORM set_config('leaflense.current_admin', v_admin_username, true);
 
     IF p_assessed_disease_id IS NOT NULL THEN
         IF NOT EXISTS (SELECT 1 FROM Diseases WHERE disease_id = p_assessed_disease_id) THEN
@@ -691,7 +922,7 @@ BEGIN
     END IF;
 
     INSERT INTO AdminReviews (submission_id, admin_id, assessed_disease_id, is_correct, notes)
-    VALUES (p_submission_id, p_admin_id, p_assessed_disease_id, p_is_correct, p_notes)
+    VALUES (p_submission_id, v_effective_admin, p_assessed_disease_id, p_is_correct, p_notes)
     RETURNING review_id INTO v_review_id;
 
     UPDATE Submissions SET status = 'reviewed' WHERE submission_id = p_submission_id;
@@ -700,6 +931,60 @@ BEGIN
     VALUES (p_submission_id, 'low_confidence', 'reviewed', v_admin_username);
 END;
 $$;
+
+ALTER PROCEDURE review_low_confidence_case(INT, INT, INT, BOOLEAN, TEXT, TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON PROCEDURE review_low_confidence_case(INT, INT, INT, BOOLEAN, TEXT, TEXT) TO leaflense_admin, leaflense_app;
+
+DROP PROCEDURE IF EXISTS reject_submission(INT, TEXT, INT, TEXT);
+
+CREATE OR REPLACE PROCEDURE reject_submission(
+    IN p_submission_id  INT,
+    IN p_reason         TEXT DEFAULT NULL,
+    IN p_admin_id       INT  DEFAULT NULL,
+    IN p_session_token  TEXT DEFAULT NULL
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = leaflense, public
+AS $$
+DECLARE
+    v_auth_admin_id     INT;
+    v_effective_admin   INT;
+    v_current_status    submission_status;
+    v_admin_username    VARCHAR(100);
+    v_admin_role        admin_role;
+BEGIN
+    v_auth_admin_id := fn_require_admin_privilege(p_session_token);
+    v_effective_admin := COALESCE(v_auth_admin_id, p_admin_id);
+    IF v_effective_admin IS NULL THEN
+        RAISE EXCEPTION 'Admin identity or session token is required to reject a submission.';
+    END IF;
+
+    SELECT username, role INTO v_admin_username, v_admin_role FROM AdminUsers WHERE admin_id = v_effective_admin AND is_active = TRUE;
+    IF NOT FOUND OR v_admin_role <> 'admin' THEN
+        RAISE EXCEPTION 'Admin % does not exist or is inactive.', v_effective_admin;
+    END IF;
+
+    SELECT status INTO v_current_status FROM Submissions WHERE submission_id = p_submission_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Submission % does not exist.', p_submission_id; END IF;
+    IF v_current_status NOT IN ('pending', 'low_confidence') THEN
+        RAISE EXCEPTION 'Submission % has status "%" and cannot be rejected.', p_submission_id, v_current_status;
+    END IF;
+
+    PERFORM set_config('leaflense.current_admin', v_admin_username, true);
+
+    INSERT INTO AdminReviews (submission_id, admin_id, assessed_disease_id, is_correct, notes)
+    VALUES (p_submission_id, v_effective_admin, NULL, FALSE, COALESCE(NULLIF(TRIM(p_reason), ''), 'Submission rejected by administrator.'));
+
+    UPDATE Submissions SET status = 'rejected' WHERE submission_id = p_submission_id;
+
+    INSERT INTO SubmissionStatusHistory (submission_id, old_status, new_status, changed_by)
+    VALUES (p_submission_id, v_current_status, 'rejected', v_admin_username);
+END;
+$$;
+
+ALTER PROCEDURE reject_submission(INT, TEXT, INT, TEXT) OWNER TO leaflense_admin;
+GRANT EXECUTE ON PROCEDURE reject_submission(INT, TEXT, INT, TEXT) TO leaflense_admin, leaflense_app;
 
 -- ============================================================================
 -- 8. TRIGGERS
@@ -740,15 +1025,19 @@ RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
-        VALUES (current_user, 'INSERT', 'submissions', NEW.submission_id, row_to_json(NEW)::JSONB);
+        VALUES (COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user), 'INSERT', 'submissions', NEW.submission_id, row_to_json(NEW)::JSONB);
     ELSIF TG_OP = 'UPDATE' THEN
         IF OLD.status IS DISTINCT FROM NEW.status THEN
             INSERT INTO AuditLogs (actor, action, table_name, record_id, old_values, new_values)
-            VALUES (current_user, 'STATUS_CHANGE', 'submissions', NEW.submission_id,
+            VALUES (COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user), 'STATUS_CHANGE', 'submissions', NEW.submission_id,
                     jsonb_build_object('status', OLD.status), jsonb_build_object('status', NEW.status));
+            IF pg_trigger_depth() <= 1 THEN
+                INSERT INTO SubmissionStatusHistory (submission_id, old_status, new_status, changed_by)
+                VALUES (NEW.submission_id, OLD.status, NEW.status, COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user));
+            END IF;
         ELSE
             INSERT INTO AuditLogs (actor, action, table_name, record_id, old_values, new_values)
-            VALUES (current_user, 'UPDATE', 'submissions', NEW.submission_id, row_to_json(OLD)::JSONB, row_to_json(NEW)::JSONB);
+            VALUES (COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user), 'UPDATE', 'submissions', NEW.submission_id, row_to_json(OLD)::JSONB, row_to_json(NEW)::JSONB);
         END IF;
     END IF;
     RETURN NEW;
@@ -764,7 +1053,7 @@ CREATE OR REPLACE FUNCTION fn_audit_prediction_insert()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
     INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
-    VALUES (current_user, 'INSERT', 'predictions', NEW.prediction_id, row_to_json(NEW)::JSONB);
+    VALUES (COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user), 'INSERT', 'predictions', NEW.prediction_id, row_to_json(NEW)::JSONB);
     RETURN NEW;
 END;
 $$;
@@ -781,10 +1070,10 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
         v_action := CASE WHEN pg_trigger_depth() > 1 THEN 'BULK_UPDATE' ELSE 'INSERT' END;
         INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
-        VALUES (current_user, v_action, 'admin_reviews', NEW.review_id, row_to_json(NEW)::JSONB);
+        VALUES (COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user), v_action, 'admin_reviews', NEW.review_id, row_to_json(NEW)::JSONB);
     ELSIF TG_OP = 'UPDATE' THEN
         INSERT INTO AuditLogs (actor, action, table_name, record_id, old_values, new_values)
-        VALUES (current_user, 'BULK_UPDATE', 'admin_reviews', NEW.review_id, row_to_json(OLD)::JSONB, row_to_json(NEW)::JSONB);
+        VALUES (COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user), 'BULK_UPDATE', 'admin_reviews', NEW.review_id, row_to_json(OLD)::JSONB, row_to_json(NEW)::JSONB);
     END IF;
     RETURN NEW;
 END;
@@ -812,11 +1101,17 @@ CREATE TRIGGER trg_update_model_timestamp
 -- 9. SEED DATA
 -- ============================================================================
 
-INSERT INTO AdminUsers (admin_id, username, password_hash, role) VALUES
-    (1, 'dr_patel',         '$2b$12$LJ3m5ZQxK8Hy9bXtRqS2/.hashed_placeholder_01', 'super_admin'),
-    (2, 'agri_expert_01',   '$2b$12$9KpVxWmN4Tz1cDfRqS3/.hashed_placeholder_02',  'reviewer'),
-    (3, 'data_analyst',     '$2b$12$mR7sXwPq2Uj8nBgYtE4/.hashed_placeholder_03',   'analyst')
-ON CONFLICT (admin_id) DO NOTHING;
+INSERT INTO AdminUsers (admin_id, username, password_hash, full_name, email, role) VALUES
+    (1, 'dr_patel',       crypt('Admin@123',    gen_salt('bf', 12)), 'Dr. Aarav Patel', 'dr.patel@leaflense.org', 'admin'),
+    (2, 'agri_expert_01', crypt('Reviewer@123', gen_salt('bf', 12)), 'Maya Lin',        'maya.lin@leaflense.org', 'admin')
+ON CONFLICT (admin_id) DO UPDATE
+    SET password_hash = EXCLUDED.password_hash,
+        full_name     = COALESCE(AdminUsers.full_name, EXCLUDED.full_name),
+        email         = COALESCE(AdminUsers.email, EXCLUDED.email),
+        role          = 'admin'
+  WHERE AdminUsers.password_hash LIKE '%hashed_placeholder%'
+     OR AdminUsers.role::TEXT <> 'admin';
+DELETE FROM AdminUsers WHERE admin_id = 3 AND username = 'data_analyst';
 SELECT setval('adminusers_admin_id_seq', (SELECT COALESCE(MAX(admin_id), 0) FROM AdminUsers));
 
 INSERT INTO Diseases (disease_id, disease_name, description, symptoms) VALUES

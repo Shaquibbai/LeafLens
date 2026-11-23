@@ -8,13 +8,23 @@
 SET search_path = leaflense, public;
 
 -- ============================================================================
--- AdminUsers (3 rows)
+-- AdminUsers (2 rows – 'admin' role only)
+-- Seeded with real bcrypt hashes via pgcrypto for immediate login testing:
+--   • dr_patel       (admin) -> Admin@123
+--   • agri_expert_01 (admin) -> Reviewer@123
 -- ============================================================================
-INSERT INTO AdminUsers (admin_id, username, password_hash, role) VALUES
-    (1, 'dr_patel',         '$2b$12$LJ3m5ZQxK8Hy9bXtRqS2/.hashed_placeholder_01', 'super_admin'),
-    (2, 'agri_expert_01',   '$2b$12$9KpVxWmN4Tz1cDfRqS3/.hashed_placeholder_02',  'reviewer'),
-    (3, 'data_analyst',     '$2b$12$mR7sXwPq2Uj8nBgYtE4/.hashed_placeholder_03',   'analyst')
-ON CONFLICT (admin_id) DO NOTHING;
+INSERT INTO AdminUsers (admin_id, username, password_hash, full_name, email, role) VALUES
+    (1, 'dr_patel',       crypt('Admin@123',    gen_salt('bf', 12)), 'Dr. Aarav Patel', 'dr.patel@leaflense.org', 'admin'),
+    (2, 'agri_expert_01', crypt('Reviewer@123', gen_salt('bf', 12)), 'Maya Lin',        'maya.lin@leaflense.org', 'admin')
+ON CONFLICT (admin_id) DO UPDATE
+    SET password_hash = EXCLUDED.password_hash,
+        full_name     = COALESCE(AdminUsers.full_name, EXCLUDED.full_name),
+        email         = COALESCE(AdminUsers.email, EXCLUDED.email),
+        role          = 'admin'
+  WHERE AdminUsers.password_hash LIKE '%hashed_placeholder%'
+     OR AdminUsers.role::TEXT <> 'admin';
+
+DELETE FROM AdminUsers WHERE admin_id = 3 AND username = 'data_analyst';
 
 SELECT setval('adminusers_admin_id_seq', (SELECT COALESCE(MAX(admin_id), 0) FROM AdminUsers));
 

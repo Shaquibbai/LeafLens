@@ -92,7 +92,7 @@ BEGIN
         -- ---- Log new submission creation ----
         INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
         VALUES (
-            current_user,
+            COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user),
             'INSERT',
             'submissions',
             NEW.submission_id,
@@ -104,7 +104,7 @@ BEGIN
             -- ---- Status change: special audit entry + history ----
             INSERT INTO AuditLogs (actor, action, table_name, record_id, old_values, new_values)
             VALUES (
-                current_user,
+                COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user),
                 'STATUS_CHANGE',
                 'submissions',
                 NEW.submission_id,
@@ -120,7 +120,10 @@ BEGIN
                 INSERT INTO SubmissionStatusHistory (
                     submission_id, old_status, new_status, changed_by
                 ) VALUES (
-                    NEW.submission_id, OLD.status, NEW.status, current_user
+                    NEW.submission_id,
+                    OLD.status,
+                    NEW.status,
+                    COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user)
                 );
             END IF;
 
@@ -128,7 +131,7 @@ BEGIN
             -- ---- Non-status update: log full row changes ----
             INSERT INTO AuditLogs (actor, action, table_name, record_id, old_values, new_values)
             VALUES (
-                current_user,
+                COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user),
                 'UPDATE',
                 'submissions',
                 NEW.submission_id,
@@ -167,7 +170,7 @@ AS $$
 BEGIN
     INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
     VALUES (
-        current_user,
+        COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user),
         'INSERT',
         'predictions',
         NEW.prediction_id,
@@ -215,7 +218,7 @@ BEGIN
 
         INSERT INTO AuditLogs (actor, action, table_name, record_id, new_values)
         VALUES (
-            current_user,
+            COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user),
             v_action,
             'admin_reviews',
             NEW.review_id,
@@ -225,7 +228,7 @@ BEGIN
     ELSIF TG_OP = 'UPDATE' THEN
         INSERT INTO AuditLogs (actor, action, table_name, record_id, old_values, new_values)
         VALUES (
-            current_user,
+            COALESCE(NULLIF(current_setting('leaflense.current_admin', true), ''), current_user),
             'BULK_UPDATE',
             'admin_reviews',
             NEW.review_id,
