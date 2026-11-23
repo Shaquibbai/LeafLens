@@ -11,9 +11,9 @@
 
 **LeafLense** is an enterprise-grade, web-based agricultural disease identification platform designed for farmers, agricultural extension workers, and plant pathologists. 
 
-Farmers can upload leaf images anonymously (no registration barrier) to identify plant infections through an image classification neural network. The system records submissions, predictions, confidence scores, and model metadata. 
+Farmers can upload leaf images anonymously (no registration barrier) and look up their submission report by submission ID. The system records submissions, predictions, confidence scores, and model metadata. 
 
-Predictions falling below the active model's confidence threshold are automatically sequestered into a triage work queue for administrator review. This guarantees diagnosis reliability for farmers while continuously producing an expert-verified ground-truth dataset for model retraining.
+Predictions falling below the active model's confidence threshold are automatically queued for administrator review. Admins log in from the corner-tab login page using a username and password, review pending low-confidence submissions, and confirm or correct the diagnosis (or reject invalid uploads) so farmers receive verified results.
 
 ---
 
@@ -22,12 +22,12 @@ Predictions falling below the active model's confidence threshold are automatica
 ```
    [ FARMER / PUBLIC USER ]
              |
-             | 1. Uploads leaf photo (No registration required)
+             | 1. Uploads leaf photo (No login required)
              v
    [ Web / Mobile Frontend ]
              |
              | 2. Saves file to local storage (e.g., /uploads/leaf_001.jpg)
-             | 3. Calls: submit_leaf_sample('/uploads/leaf_001.jpg', OUT v_id)
+             | 3. Calls: submit_leaf_sample('/uploads/leaf_001.jpg', OUT v_id, p_additional_info)
              v
    [ PostgreSQL: Submissions Table ]  --> Status = 'pending'
              |                        --> SubmissionStatusHistory record added
@@ -45,69 +45,75 @@ Predictions falling below the active model's confidence threshold are automatica
              |                                                              |
    Status -> 'processed'                                          Status -> 'low_confidence'
              |                                                              |
-   * Frontend immediately displays:                               * Frontend shows:
-     - Disease Name                                                 "Image submitted for expert
-     - Symptoms                                                      agricultural review."
-     - Treatment Recommendations                                            |
-                                                                            v
-                                                               [ Admin Review Dashboard ]
-                                                               (Query 2 fetches pending cases)
+   * Farmer report immediately shows:                             * Farmer report shows:
+     - Disease Name, Symptoms,                                      status = 'pending'
+       Treatment Recommendations                                    (predictions kept hidden)
                                                                             |
-                                                                            | 6. Expert inspects leaf
-                                                                            | 7. Calls review procedure
                                                                             v
-                                                               [ Procedure: review_low_confidence_case() ]
+                                                               [ Corner Tab -> Admin Login ]
+                                                                login_admin(username, password)
                                                                             |
-                                                                            | Saves AdminReviews record
                                                                             v
-                                                                 Status -> 'reviewed'
-                                                                 (Feeds Model Evaluation Metrics)
+                                                               [ Admin Review Queue ]
+                                                                get_pending_low_confidence_submissions(token)
+                                                                            |
+                                                                            | 6. Admin inspects leaf
+                                                                            | 7. Calls review_low_confidence_case()
+                                                                            |    or reject_submission()
+                                                                            v
+                                                                 Status -> 'reviewed' / 'rejected'
+                                                                 (Farmer report now shows verified result)
 ```
 
 ---
 
-## 3. Database Table Catalogue (11 Tables)
+## 3. Database Table Catalogue (12 Tables)
 
 | Table Name | Primary Key | Foreign Keys & Relationships | Core Business Purpose |
 | :--- | :--- | :--- | :--- |
-| **`AdminUsers`** | `admin_id` (`SERIAL`) | None | System administrators, review specialists, and analysts. Stores roles (`super_admin`, `reviewer`, `analyst`) and password hashes. |
-| **`Models`** | `model_id` (`SERIAL`) | None (Unique on `model_name, version`) | Registry of computer vision models. Stores active status flag and the dynamic `confidence_threshold` ($0.0 - 1.0$). |
+| **`AdminUsers`** | `admin_id` (`SERIAL`) | None | System administrators (`role = 'admin'`). Stores username, bcrypt password hashes, lockout state, and active status. |
+| **`AdminSessions`** | `session_id` (`SERIAL`) | `admin_id` | Stores hashed session tokens (`token_hash`), expiration, and revocation flags for logged-in admins. |
+| **`Models`** | `model_id` (`SERIAL`) | None (Unique on `model_name, version`) | Registry of computer vision models. Stores active status flag and `confidence_threshold` ($0.0 - 1.0$). |
 | **`Diseases`** | `disease_id` (`SERIAL`) | None (Unique on `disease_name`) | Catalogue of crop diseases. Includes symptoms description shown to farmers and contains a baseline `Healthy` class. |
-| **`Submissions`** | `submission_id` (`SERIAL`) | None (Referenced by Predictions, Reviews, History) | Farmer leaf image uploads. Tracks local file path, submission timestamp, client IP, and lifecycle status. |
+| **`Submissions`** | `submission_id` (`SERIAL`) | None (Referenced by Predictions, Reviews, History) | Farmer leaf image uploads. Tracks local file path, farmer notes, submission timestamp, client IP, and lifecycle status. |
 | **`Predictions`** | `prediction_id` (`SERIAL`) | `submission_id`, `model_id`, `disease_id` | Classification output scores. Flags the top winning prediction per submission via `is_top_prediction`. |
 | **`ModelClasses`** | `model_class_id` (`SERIAL`) | `model_id`, `disease_id` | Many-to-Many bridge defining which disease classes each model is certified to predict. |
-| **`AdminReviews`** | `review_id` (`SERIAL`) | `submission_id`, `admin_id`, `assessed_disease_id` | Manual expert reviews of low-confidence cases. Records diagnosis, correctness verdict, and observational notes. |
+| **`AdminReviews`** | `review_id` (`SERIAL`) | `submission_id`, `admin_id`, `assessed_disease_id` | Manual admin reviews of low-confidence cases. Records diagnosis, correctness verdict, and observational notes. |
 | **`Recommendations`** | `recommendation_id` (`SERIAL`) | None | Curated treatment advice, chemical/biological remedies, cultural practices, and advisory citations. |
 | **`DiseaseRecommendations`** | `(disease_id, recommendation_id)` | `disease_id`, `recommendation_id` | Many-to-Many mapping associating multiple treatments and management guidelines to each specific disease. |
 | **`SubmissionStatusHistory`** | `history_id` (`SERIAL`) | `submission_id` | Immutable state transition ledger tracking status progression (e.g., `pending` $\rightarrow$ `low_confidence` $\rightarrow$ `reviewed`). |
-| **`AuditLogs`** | `audit_id` (`SERIAL`) | None | System-wide security and compliance ledger capturing actor identity, action type, and old/new JSONB row snapshots. |
+| **`AuditLogs`** | `audit_id` (`SERIAL`) | None | System-wide security and compliance ledger capturing actor identity, action type (including login/logout events), and old/new JSONB row snapshots. |
 
 ---
 
-## 4. Stored Functions (Admin Role-Guarded)
+## 4. Stored Functions (Admin Auth & Role-Gated Access)
 
-All administrative functions are enforced using `SECURITY DEFINER` and verify that the caller is a member of the `leaflense_admin` role or superuser.
+Administrative functions run as `SECURITY DEFINER` and verify an active `AdminSessions` token belonging to an active `'admin'` user (or `leaflense_admin`/`postgres` DB roles).
 
-### 1. `get_active_confidence_threshold() -> NUMERIC(5,4)`
-* **Description:** Dynamically returns the minimum operational confidence threshold across all currently active models.
-* **Usage:** Used by API engines to determine whether a diagnosis can be auto-accepted or requires human intervention.
-* **Example Call:** `SELECT get_active_confidence_threshold();` $\rightarrow$ Returns `0.7500`.
+### 1. `login_admin(p_username, p_password, p_ip_address, p_user_agent)`
+* **Description:** Authenticates an admin from the corner-tab login page using bcrypt (`pgcrypto`), enforces temporary lockouts after repeated failed logins, issues a 12-hour session token, and returns admin profile and capabilities.
 
-### 2. `calculate_model_performance(p_model_id INT) -> TABLE(...)`
-* **Description:** Computes precision metrics for a model by evaluating its predictions against human administrator verified labels (`AdminReviews`).
-* **Returned Columns:** `total_predictions`, `verified_predictions`, `correct_predictions`, `accuracy (%)`, `avg_confidence`.
-* **Example Call:** `SELECT * FROM calculate_model_performance(1);`
+### 2. `verify_admin_session(p_session_token)`
+* **Description:** Validates an active session token and refreshes `last_activity_at`.
 
-### 3. `get_disease_statistics(p_start_date, p_end_date) -> TABLE(...)`
-* **Description:** Aggregates disease detection frequency, average confidence scores, high-vs-low confidence distributions, and temporal detection spans within an optional date window.
-* **Example Call:** `SELECT * FROM get_disease_statistics(NOW() - INTERVAL '30 days', NOW());`
+### 3. `logout_admin(p_session_token) -> BOOLEAN`
+* **Description:** Revokes an active session token and logs a `LOGOUT` entry in `AuditLogs`.
+
+### 4. `get_pending_low_confidence_submissions(p_session_token)`
+* **Description:** Returns all submissions in `'low_confidence'` status sorted by lowest confidence score first for the authenticated admin review queue.
+
+### 5. `get_farmer_submission_report(p_submission_id)`
+* **Description:** Login-free farmer report lookup. Hides predictions and recommendations (`NULL`) with `status = 'pending'` while `'pending'` or `'low_confidence'`, and returns the AI or admin-verified diagnosis and recommendations once `'processed'` or `'reviewed'`.
+
+### 6. `fn_get_role_privileges(p_role)` & `fn_require_admin_privilege(p_session_token)`
+* **Description:** Internal privilege mapping and session/role enforcement helpers for `'admin'` users.
 
 ---
 
 ## 5. Stored Procedures (Application State Machine)
 
-### 1. `submit_leaf_sample(IN p_image_path, OUT p_submission_id, IN p_ip_address, IN p_user_agent)`
-* Atomically creates an immutable submission record with initial status `'pending'`.
+### 1. `submit_leaf_sample(IN p_image_path, OUT p_submission_id, IN p_additional_info, IN p_ip_address, IN p_user_agent)`
+* Atomically creates an anonymous farmer submission record with initial status `'pending'`.
 * Immediately writes the initial baseline entry into `SubmissionStatusHistory`.
 * Returns the newly generated `submission_id` for frontend reference.
 
@@ -119,11 +125,14 @@ All administrative functions are enforced using `SECURITY DEFINER` and verify th
   * If `p_confidence_score < threshold` $\rightarrow$ Sets status to `'low_confidence'`.
   * Logs the transition into `SubmissionStatusHistory`.
 
-### 3. `review_low_confidence_case(IN p_submission_id, IN p_admin_id, IN p_assessed_disease_id, IN p_is_correct, IN p_notes)`
-* Validates that the target submission is currently in `'low_confidence'` state.
-* Records the specialist's assessment and correctness verdict in `AdminReviews`.
+### 3. `review_low_confidence_case(IN p_submission_id, IN p_admin_id, IN p_assessed_disease_id, IN p_is_correct, IN p_notes, IN p_session_token)`
+* Validates admin session and that the target submission is currently in `'low_confidence'` state.
+* Records the admin's assessment and correctness verdict in `AdminReviews`.
 * Updates the submission status to `'reviewed'`.
-* Records the specialist's username and timestamp in `SubmissionStatusHistory`.
+* Records the admin's username and timestamp in `SubmissionStatusHistory`.
+
+### 4. `reject_submission(IN p_submission_id, IN p_reason, IN p_admin_id, IN p_session_token)`
+* Validates admin session and transitions a `'pending'` or `'low_confidence'` submission to `'rejected'`, logging the rejection reason in `AdminReviews` and `SubmissionStatusHistory`.
 
 ---
 
@@ -141,23 +150,19 @@ All administrative functions are enforced using `SECURITY DEFINER` and verify th
 4. **`trg_audit_bulk_changes`** (`AFTER INSERT OR UPDATE ON AdminReviews`):
    * Logs review entries; tags multi-row or cascaded modifications as `BULK_UPDATE`.
 5. **`trg_update_model_timestamp`** (`BEFORE UPDATE ON Models`):
-   * Maintains `updated_at` automatically whenever model hyperparameters or thresholds change.
+   * Maintains `updated_at` automatically whenever model thresholds or active flags change.
 
 ---
 
-## 7. Analytical Query Suite (9 Major Queries)
+## 7. Query Suite (`04_queries.sql`)
 
 | # | Query Title | Business Function |
 | :--- | :--- | :--- |
-| **Q1** | Submission Full Detail | Fetches submission metadata, image path, model version, disease name, and confidence score for a given ID. |
-| **Q2** | **Pending Low-Confidence Queue** | Populates the admin triage dashboard. Filters `status = 'low_confidence'` and sorts by confidence ascending (weakest first). |
-| **Q3** | Admin Review History | Lists all reviews performed by a given specialist, comparing original predictions against expert diagnoses. |
+| **Q1** | Farmer Report Lookup | Fetches the farmer-facing submission report for a given `submission_id` without login (`get_farmer_submission_report`). |
+| **Q2** | **Pending Low-Confidence Queue** | Populates the admin review queue (`v_pending_low_confidence_reviews`). Filters `status = 'low_confidence'` and sorts by confidence ascending. |
+| **Q3** | Admin Review History | Lists all reviews performed by a given admin, comparing original predictions against admin diagnoses. |
 | **Q4** | Disease Recommendations | Displays full treatment instructions, cultural practices, and citations linked to each disease. |
-| **Q5** | Disease Volume Ranking | Ranks diseases by prediction frequency using `DENSE_RANK()`, with high vs. low confidence breakdowns. |
-| **Q6** | Period Trend Comparison | Uses dual CTEs and `FULL OUTER JOIN` to compare diagnosis volumes between two 30-day windows and calculate percentage shifts. |
-| **Q7** | Multi-Level Confidence Stats | Uses `GROUPING SETS` to generate overall, per-model, and per-disease confidence aggregates in one scan. |
-| **Q8** | Ground-Truth Model Evaluation | Calculates true accuracy and per-disease precision by comparing AI predictions with verified `AdminReviews`. |
-| **Q9** | Executive Reports (9a, 9b, 9c) | Three modular reporting blocks: (9a) Disease summary, (9b) Model performance scorecard, and (9c) Monthly volume metrics. |
+| **Q5** | Frontend Integration Smoke Test | Demonstrates the end-to-end SQL calls: `login_admin`, `verify_admin_session`, `get_pending_low_confidence_submissions`, `review_low_confidence_case`, `logout_admin`, and login-free `submit_leaf_sample`. |
 
 ---
 
